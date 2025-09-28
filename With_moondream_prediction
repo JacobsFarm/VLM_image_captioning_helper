@@ -1,0 +1,526 @@
+import os
+import sys
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from PIL import Image, ImageTk
+import shutil
+from pathlib import Path
+import json
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import warnings
+
+# Suppress warnings like in your script
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+# Configuration - adjust these paths to match your project structure
+model_path = "vikhyatk/moondream2"  # Using standard Moondream2 model
+input_folder = "annotate"  # Folder containing images to be annotated
+output_folder_labels = "annotated_labels"  # Folder for JSON files
+output_folder_images = "annotated_images"  # Folder for annotated images
+delete_folder = "Delete"  # Folder for storing deleted/transferred images
+enable_delete_mode = True  # Set to either False or True to enable image deletion functionality from start-up
+
+# Predefined questions for the VLM
+DEFAULT_QUESTIONS = [
+    "What do you see in this image?",
+    "Describe the position of the cow.",
+    "What is the posture of the animal?",
+    "Is the cow standing or lying down?"
+]
+
+# Confidence threshold for auto-save (set to 0 to disable auto-save)
+AUTO_SAVE_CONFIDENCE_THRESHOLD = 0.9
+
+class MoondreamAnnotationApp:
+    def __init__(self, root, model_path, input_folder, output_folder_labels, output_folder_images, delete_folder, enable_delete_mode):
+        self.root = root
+        self.root.title("Moondream AI-Assisted Annotation Helper")
+        self.root.geometry("1600x900")
+        
+        # Set up folders and model path
+        self.model_path = model_path
+        self.input_folder = input_folder
+        self.output_folder_labels = output_folder_labels
+        self.output_folder_images = output_folder_images
+        self.delete_folder = delete_folder
+        self.delete_mode_enabled = enable_delete_mode
+        
+        # Create output folders if they don't exist
+        os.makedirs(self.output_folder_labels, exist_ok=True)
+        os.makedirs(self.output_folder_images, exist_ok=True)
+        os.makedirs(self.delete_folder, exist_ok=True)
+        
+        # Get all images
+        self.image_files = [f for f in os.listdir(self.input_folder) 
+                            if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        self.current_index = 0
+        
+        # Variables for annotation
+        self.current_question = DEFAULT_QUESTIONS[0]
+        self.ai_generated_answer = ""
+        self.current_img = None
+        self.current_image_info = {}
+        self.model_confidence = 0.0
+        
+        # Load the Moondream model
+        self.load_model()
+        
+        # UI setup
+        self.setup_ui()
+        
+        # Load the first image
+        if self.image_files:
+            self.root.update_idletasks()
+            self.root.after(100, self.load_current_image)
+    
+    def load_model(self):
+        """Load the Moondream model using the same method as your existing script"""
+        try:
+            print("Loading Moondream model...")
+            
+            # Use the same model loading approach as your script
+            self.moondream_model_id = "vikhyatk/moondream2"
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.moondream_model_id, 
+                trust_remote_code=True,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(self.moondream_model_id)
+            
+            print("Model loaded successfully!")
+            
+            # Check GPU availability
+            if torch.cuda.is_available():
+                print(f"CUDA available: {torch.cuda.get_device_name()}")
+            else:
+                print("Running on CPU (slower)")
+            
+            self.model_loaded = True
+            
+        except Exception as e:
+            print(f"Error loading Moondream model: {e}")
+            messagebox.showerror("Model Error", f"Could not load Moondream model:\n{str(e)}")
+            self.model_loaded = False
+    
+    def generate_ai_description(self, image_path, question):
+        """Generate description using Moondream with the same method as your script"""
+        if not self.model_loaded:
+            return "Model not loaded", 0.0
+        
+        try:
+            # Load and preprocess image (same as your script)
+            image = Image.open(image_path).convert('RGB')
+            
+            # Resize image if too large (for speed, same as your script)
+            if image.size[0] > 512 or image.size[1] > 512:
+                image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            
+            # Use the same Moondream encoding method as your script
+            enc_image = self.model.encode_image(image)
+            response = self.model.answer_question(
+                enc_image, 
+                question, 
+                self.tokenizer
+            )
+            
+            answer = response.strip()
+            
+            # Calculate a simple confidence score based on response length and content
+            confidence = min(1.0, len(answer) / 50.0)  # Simple length-based confidence
+            if "yes" in answer.lower() or "no" in answer.lower():
+                confidence = min(confidence + 0.2, 1.0)  # Boost for definitive answers
+            
+            return answer, confidence
+            
+        except Exception as e:
+            print(f"Error generating AI description: {e}")
+            return f"Error: {str(e)}", 0.0
+    
+    def setup_ui(self):
+        # Main container
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Left side: Image display
+        image_frame = ttk.LabelFrame(main_frame, text="Image")
+        image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        
+        self.image_canvas = tk.Canvas(image_frame, highlightthickness=0, bg='white')
+        self.image_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Right side: AI-assisted annotation panel
+        annotation_frame = ttk.LabelFrame(main_frame, text="AI-Assisted Annotation")
+        annotation_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        annotation_frame.config(width=600)
+        
+        # Question selection
+        question_frame = ttk.LabelFrame(annotation_frame, text="Question for AI")
+        question_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.question_var = tk.StringVar(value=self.current_question)
+        for i, question in enumerate(DEFAULT_QUESTIONS):
+            ttk.Radiobutton(question_frame, text=f"{i+1}. {question}", 
+                           variable=self.question_var, value=question,
+                           command=self.update_question).pack(anchor=tk.W, padx=5, pady=2)
+        
+        # Custom question entry
+        ttk.Label(question_frame, text="Or custom question:").pack(anchor=tk.W, padx=5)
+        self.custom_question_entry = ttk.Entry(question_frame, width=60)
+        self.custom_question_entry.pack(fill=tk.X, padx=5, pady=2)
+        self.custom_question_entry.bind('<KeyRelease>', self.update_custom_question)
+        
+        # Generate AI answer button
+        generate_frame = ttk.Frame(question_frame)
+        generate_frame.pack(fill=tk.X, pady=5)
+        
+        self.generate_button = ttk.Button(generate_frame, text="Generate AI Answer (G)", 
+                                         command=self.generate_ai_answer)
+        self.generate_button.pack(side=tk.LEFT, padx=5)
+        
+        # Auto-generate checkbox
+        self.auto_generate_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(generate_frame, text="Auto-generate on image load", 
+                       variable=self.auto_generate_var).pack(side=tk.LEFT, padx=5)
+        
+        # AI-generated answer display and editing
+        ai_frame = ttk.LabelFrame(annotation_frame, text="AI-Generated Answer")
+        ai_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Confidence indicator
+        self.confidence_frame = ttk.Frame(ai_frame)
+        self.confidence_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(self.confidence_frame, text="AI Confidence:").pack(side=tk.LEFT)
+        self.confidence_label = ttk.Label(self.confidence_frame, text="N/A", foreground="blue")
+        self.confidence_label.pack(side=tk.LEFT, padx=5)
+        
+        # Editable text area for AI answer
+        self.ai_answer_text = scrolledtext.ScrolledText(ai_frame, height=8, wrap=tk.WORD)
+        self.ai_answer_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Quick editing buttons
+        edit_frame = ttk.Frame(ai_frame)
+        edit_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Button(edit_frame, text="Clear", command=self.clear_answer).pack(side=tk.LEFT, padx=2)
+        ttk.Button(edit_frame, text="Regenerate", command=self.generate_ai_answer).pack(side=tk.LEFT, padx=2)
+        
+        # Auto-save indicator
+        self.auto_save_frame = ttk.Frame(annotation_frame)
+        self.auto_save_frame.pack(fill=tk.X, pady=5)
+        
+        self.auto_save_label = ttk.Label(self.auto_save_frame, text="", foreground="green")
+        self.auto_save_label.pack()
+        
+        # Control buttons
+        button_frame = ttk.Frame(annotation_frame)
+        button_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Delete mode toggle checkbox
+        self.delete_mode_var = tk.BooleanVar(value=self.delete_mode_enabled)
+        self.delete_mode_checkbox = ttk.Checkbutton(
+            button_frame, 
+            text="Delete Mode", 
+            variable=self.delete_mode_var,
+            command=self.toggle_delete_mode
+        )
+        self.delete_mode_checkbox.pack(pady=5)
+        
+        # Navigation buttons
+        nav_frame = ttk.Frame(button_frame)
+        nav_frame.pack(fill=tk.X)
+        
+        ttk.Button(nav_frame, text="Previous (A)", command=self.prev_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="Next (D)", command=self.next_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="Save (S)", command=self.save_annotation).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="Skip (O)", command=self.skip_current).pack(side=tk.LEFT, padx=2)
+        
+        # Status bar
+        self.status_frame = ttk.Frame(self.root)
+        self.status_frame.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        self.status_label = ttk.Label(self.status_frame, text="")
+        self.status_label.pack(side=tk.LEFT, padx=10, pady=5)
+        
+        # Keyboard shortcuts
+        self.setup_keyboard_shortcuts()
+    
+    def setup_keyboard_shortcuts(self):
+        # Navigation
+        self.root.bind("<a>", lambda event: self.prev_image())
+        self.root.bind("<A>", lambda event: self.prev_image())
+        self.root.bind("<Left>", lambda event: self.prev_image())
+        
+        self.root.bind("<d>", lambda event: self.next_image())
+        self.root.bind("<D>", lambda event: self.next_image())
+        self.root.bind("<Right>", lambda event: self.next_image())
+        
+        self.root.bind("<s>", lambda event: self.save_annotation())
+        self.root.bind("<S>", lambda event: self.save_annotation())
+        
+        self.root.bind("<o>", lambda event: self.skip_current())
+        self.root.bind("<O>", lambda event: self.skip_current())
+        
+        self.root.bind("<g>", lambda event: self.generate_ai_answer())
+        self.root.bind("<G>", lambda event: self.generate_ai_answer())
+        
+        self.root.bind("<Q>", lambda event: self.root.quit())
+        self.root.bind("<q>", lambda event: self.root.quit())
+        self.root.bind("<Escape>", lambda event: self.root.quit())
+    
+    def toggle_delete_mode(self):
+        """Toggle delete mode on/off"""
+        self.delete_mode_enabled = self.delete_mode_var.get()
+        
+        # Update the current status display
+        if self.image_files:
+            status_text = f"Image {self.current_index + 1} of {len(self.image_files)}: {self.image_files[self.current_index]}"
+            if self.delete_mode_enabled:
+                status_text += " | Delete mode: ON - processed images will be moved"
+            self.status_label.config(text=status_text)
+    
+    def move_to_delete_if_enabled(self, img_filename):
+        """Move image to DELETE folder if delete mode is enabled"""
+        if not self.delete_mode_enabled:
+            return False
+            
+        source_path = os.path.join(self.input_folder, img_filename)
+        dest_path = os.path.join(self.delete_folder, img_filename)
+        
+        try:
+            # Move the image to the DELETE folder
+            shutil.move(source_path, dest_path)
+            print(f"Image moved to DELETE: {img_filename}")
+            return True
+        except Exception as e:
+            print(f"Error moving to DELETE: {e}")
+            return False
+    
+    def copy_image_to_annotated(self, img_filename):
+        """Copy image to annotated_images folder"""
+        source_path = os.path.join(self.input_folder, img_filename)
+        dest_path = os.path.join(self.output_folder_images, img_filename)
+        
+        try:
+            # Copy the image to the annotated_images folder
+            shutil.copy2(source_path, dest_path)
+            print(f"Image copied to annotated_images: {img_filename}")
+            return True
+        except Exception as e:
+            print(f"Error copying to annotated_images: {e}")
+            return False
+    
+    def load_current_image(self):
+        if not self.image_files:
+            self.status_label.config(text="No images found!")
+            return
+        
+        # Update status
+        status_text = f"Image {self.current_index + 1} of {len(self.image_files)}: {self.image_files[self.current_index]}"
+        if self.delete_mode_enabled:
+            status_text += " | Delete mode: ON - processed images will be moved"
+        self.status_label.config(text=status_text)
+        
+        # Load image
+        img_path = os.path.join(self.input_folder, self.image_files[self.current_index])
+        self.current_img_path = img_path
+        
+        # Load and display image
+        original_img = cv2.imread(img_path)
+        original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+        self.current_img = original_img
+        
+        self.display_image(original_img, self.image_canvas)
+        
+        # Clear previous AI answer
+        self.ai_answer_text.delete(1.0, tk.END)
+        self.confidence_label.config(text="N/A")
+        self.auto_save_label.config(text="")
+        
+        # Auto-generate AI answer if enabled
+        if self.auto_generate_var.get():
+            self.root.after(100, self.generate_ai_answer)  # Small delay to let image load
+    
+    def display_image(self, cv_img, canvas):
+        """Displays an image centered on the canvas"""
+        canvas_width = canvas.winfo_width() or 600
+        canvas_height = canvas.winfo_height() or 600
+        
+        height, width = cv_img.shape[:2]
+        
+        # Calculate scale factor
+        scale = min(canvas_width / width, canvas_height / height) * 0.9
+        
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        if scale != 1.0:
+            cv_img = cv2.resize(cv_img, (new_width, new_height))
+        
+        # Convert to PIL and then to Tkinter format
+        pil_img = Image.fromarray(cv_img)
+        tk_img = ImageTk.PhotoImage(pil_img)
+        
+        # Clear canvas and add image
+        canvas.delete("all")
+        
+        x_offset = (canvas_width - new_width) // 2
+        y_offset = (canvas_height - new_height) // 2
+        
+        canvas.create_image(x_offset, y_offset, anchor=tk.NW, image=tk_img)
+        canvas.image = tk_img
+    
+    def update_question(self):
+        self.current_question = self.question_var.get()
+        self.custom_question_entry.delete(0, tk.END)
+    
+    def update_custom_question(self, event=None):
+        custom_text = self.custom_question_entry.get().strip()
+        if custom_text:
+            self.current_question = custom_text
+            self.question_var.set("")  # Deselect radio buttons
+    
+    def generate_ai_answer(self):
+        """Generate AI answer for the current image and question"""
+        if not self.model_loaded:
+            self.ai_answer_text.delete(1.0, tk.END)
+            self.ai_answer_text.insert(1.0, "Model not loaded. Please check model path.")
+            return
+        
+        # Show loading message
+        self.ai_answer_text.delete(1.0, tk.END)
+        self.ai_answer_text.insert(1.0, "Generating AI answer...")
+        self.confidence_label.config(text="Processing...")
+        self.root.update()
+        
+        # Generate answer using AI
+        answer, confidence = self.generate_ai_description(self.current_img_path, self.current_question)
+        
+        # Update UI with AI answer
+        self.ai_answer_text.delete(1.0, tk.END)
+        self.ai_answer_text.insert(1.0, answer)
+        
+        # Update confidence display
+        confidence_text = f"{confidence:.1%}"
+        confidence_color = "green" if confidence > 0.7 else "orange" if confidence > 0.4 else "red"
+        self.confidence_label.config(text=confidence_text, foreground=confidence_color)
+        
+        self.model_confidence = confidence
+        
+        # Check for auto-save
+        if confidence >= AUTO_SAVE_CONFIDENCE_THRESHOLD and AUTO_SAVE_CONFIDENCE_THRESHOLD > 0:
+            self.auto_save_label.config(text=f"High confidence ({confidence:.1%}) - Auto-save enabled")
+        else:
+            self.auto_save_label.config(text="")
+    
+    def clear_answer(self):
+        """Clear the AI answer text"""
+        self.ai_answer_text.delete(1.0, tk.END)
+        self.confidence_label.config(text="N/A")
+        self.auto_save_label.config(text="")
+    
+    def generate_json_data(self):
+        """Generate the JSON data structure for the current annotation"""
+        img_filename = self.image_files[self.current_index]
+        base_name = os.path.splitext(img_filename)[0]
+        
+        # Get the current answer from the text area
+        answer = self.ai_answer_text.get(1.0, tk.END).strip()
+        
+        # Create the JSON structure with relative path to annotated_images
+        json_data = {
+            "id": base_name,
+            "image": os.path.join(self.output_folder_images, img_filename),
+            "conversations": [
+                {
+                    "from": "human", 
+                    "value": f"<image>\n{self.current_question}"
+                },
+                {
+                    "from": "gpt",
+                    "value": answer
+                }
+            ],
+            "metadata": {
+                "ai_generated": True,
+                "confidence": self.model_confidence,
+                "model": "moondream",
+                "question": self.current_question
+            }
+        }
+        
+        return json_data
+    
+    def save_annotation(self):
+        """Save the current annotation as a JSON file and copy image to annotated_images"""
+        if not self.image_files:
+            return
+        
+        # Check if we have any content to save
+        answer = self.ai_answer_text.get(1.0, tk.END).strip()
+        if not answer:
+            messagebox.showwarning("Warning", "Please generate or enter an answer before saving.")
+            return
+        
+        # Generate JSON data
+        json_data = self.generate_json_data()
+        
+        # Get filenames
+        img_filename = self.image_files[self.current_index]
+        base_name = os.path.splitext(img_filename)[0]
+        json_filename = f"{base_name}.json"
+        json_path = os.path.join(self.output_folder_labels, json_filename)
+        
+        try:
+            # Save JSON file to annotated_label folder
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            
+            # Copy image to annotated_images folder
+            self.copy_image_to_annotated(img_filename)
+            
+            # Move to DELETE folder if delete mode is enabled
+            self.move_to_delete_if_enabled(img_filename)
+            
+            self.status_label.config(text=f"Annotation saved: {json_filename} | Image copied to annotated_images")
+            self.next_image()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save annotation: {str(e)}")
+    
+    def skip_current(self):
+        """Skip the current image"""
+        img_filename = self.image_files[self.current_index]
+        
+        # Move to DELETE folder if delete mode is enabled
+        self.move_to_delete_if_enabled(img_filename)
+        
+        self.status_label.config(text=f"Image skipped: {img_filename}")
+        self.next_image()
+    
+    def next_image(self):
+        if self.current_index < len(self.image_files) - 1:
+            self.current_index += 1
+            self.load_current_image()
+        else:
+            messagebox.showinfo("Complete", "All images have been processed!")
+    
+    def prev_image(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.load_current_image()
+
+def main():
+    # Start the application
+    root = tk.Tk()
+    app = MoondreamAnnotationApp(root, model_path, input_folder, output_folder_labels, 
+                                output_folder_images, delete_folder, enable_delete_mode)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
